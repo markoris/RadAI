@@ -117,25 +117,11 @@ def load_korg_data():
         abun = abun_elem()      # log10(N_el / N_H) + 12
         masses = elem_masses()  # atomic mass units (amu)
         
-        # sum of abundances transcribed from table does not add up to 0.013
-        # we introduce a normalization factor w_i = 0.013 * Y_i / sum(Y_i) to ensure sum(w_i) = 0.013
-        # we get the mass of the metals m_metals = sum( w_i * m_i )
-        
-        # [2:] to skip H and He in abundance sum; these are covered by X and Y in 1 = X + Y + Z (where Z are our metals)
-        sum_abun = get_N_elem(np.array([a for a in abun.values()]))[2:].sum()
-        norm_factor = (1 - 0.738 - 0.2485)/sum_abun
-        
         amu = constants.u.to('gram')
-        # calculate mass contribution from metals 
-        for element in abun.keys():
-            if element == 'H' or element == 'He': continue
-            elem_abun = get_N_elem(abun[element])#/sum_abun # fractional abundance of the element
-            elem_mass = elem_abun * norm_factor * masses[element] * amu # fractional abundance times norm_factor to scale to 0.013 = 1 - X - Y times the mass 
-            try: mass_metals.append(elem_mass) 
-            except NameError: mass_metals = [elem_mass]
-        
-        #m_H + m_He + m_z
-        mass_gas = 0.738 * amu + 0.2485 * (4 * amu) + sum(mass_metals)
+
+        # mean mass per particle, weighted by number: sum(N_el * m_el) / sum(N_el), with N_el / N_H from the abundance table
+        N_elem = {element: get_N_elem(abun[element]) for element in abun.keys()}
+        mass_gas = sum(N_elem[element] * masses[element] for element in N_elem) / sum(N_elem.values()) * amu
         rho_gas = mass_gas*n_gas
         rho_e = n_e * constants.m_e.to('gram')
         korg_rho = rho_gas + rho_e
