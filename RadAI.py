@@ -10,10 +10,6 @@ from astropy import constants
 from astropy.io import fits
 from scipy.interpolate import CubicSpline as cs
 from scipy.interpolate import RectBivariateSpline
-try:
-    from scipy.integrate import simpson
-except ImportError:
-    from scipy.integrate import simps as simpson
 from scipy.signal import savgol_filter
 import sys
 import os
@@ -27,15 +23,40 @@ def to_numpy(x):
         return x.detach().cpu().numpy()
     return x
 
-def nbins(r_min, r_max, tau_0, tau_factor=1):
-    """Estimate number of bins for integration"""
-    return int(max(100, tau_0 * tau_factor * 10))
+def tau_anchored_depth(z, tau_5000, alpha_5000, n_sub=64):
+    """
+    Rebuild the depth scale so that integrating alpha_5000 over it reproduces tau_5000.
+
+    dz = -dtau_5000/alpha_5000 gives int(alpha_lam dz) = int((alpha_lam/alpha_5000) dtau_5000),
+    Korg's anchored optical depth. tau/alpha is close to a power law in tau, so ln(tau/alpha)
+    is splined against ln(tau) and integrated on n_sub sub-steps per layer.
+
+    Args:
+        z: depth from load_korg_data, index 0 = deepest [cm]
+        tau_5000: reference optical depth, aligned with z
+        alpha_5000: absorption coefficient at 5000 Å, aligned with z [cm^-1]
+        n_sub: sub-steps per layer
+
+    Returns:
+        Rebuilt depth [cm], same ordering as z, with the same z[0]
+    """
+    # Reverse to top-down so that tau increases
+    ln_tau = np.log(tau_5000[::-1])
+    ln_ratio = cs(ln_tau, np.log(tau_5000[::-1]/alpha_5000[::-1]))
+
+    lo, hi = ln_tau[:-1, None], ln_tau[1:, None]
+    ratio = np.exp(ln_ratio(lo + (hi - lo)*np.linspace(0, 1, n_sub+1)[None, :]))
+    dz = (hi - lo).flatten() * (ratio[:, :-1] + ratio[:, 1:]).sum(axis=1) / (2*n_sub)
+
+    depth = np.concatenate([[0], np.cumsum(dz)]) # measured down from the top
+    return z[0] + (depth[-1] - depth)[::-1]
 
 class RadAI():
 
     def __init__(self, r_norm='log', r_max_factor=1,
                  test_name='RadAI', lr=1e-3, n_hidden=512, n_layers=6,
-                 mu_min=0.05, mu_max=1.0, n_collocation=1024, n_boundary=100):
+                 mu_min=0.05, mu_max=1.0, n_collocation=1024, n_boundary=100,
+                 logg=4.44, stellar_mass=1.0, escape_floor=0.05):
 
         self.r_norm = r_norm
         self.test_name = test_name
@@ -47,6 +68,9 @@ class RadAI():
         self.mu_max = float(mu_max)
         self.n_collocation = int(n_collocation)
         self.n_boundary = int(n_boundary)
+        self.logg = float(logg)
+        self.stellar_mass = float(stellar_mass)
+        self.escape_floor = float(escape_floor)
 
         # Validate mu range
         assert 0 < self.mu_min < self.mu_max <= 1.0, "mu_min must be > 0 and mu_max must be <= 1.0 with mu_min < mu_max"
@@ -60,7 +84,7 @@ class RadAI():
 
         # PyTorch settings
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
         torch.set_default_dtype(torch.float32)
         print(f"Using device: {self.device}")
 
@@ -69,11 +93,24 @@ class RadAI():
         self.h = 6.626e-27 # cm^2 g s^-1
         self.c = 2.9979e10 # cm/s
         self.k = 1.3807e-16 # cm^2 g s^-2 K^-1
+        self.G = 6.6743e-8 # cm^3 g^-1 s^-2
+        self.M_sun = 1.9884e33 # g
 
         # Load Korg simulation data and relevant quantities
 
         #self.korg_wav, z, temp, korg_rho, korg_kappa_array = load_multi_wavelength_data()
-        self.korg_wav, self.korg_flux, z, temp, korg_rho, korg_kappa_array, tau_5000 = load_korg_data()
+        self.korg_wav, self.korg_flux, z, temp, korg_rho, korg_kappa_array, tau_5000, z_0 = load_korg_data()
+
+        #-- Rebuild z so that integrating Korg's opacity over it reproduces the model's tau_5000
+        #-- (Korg's anchored optical depth, expressed as a length)
+        alpha_5000 = korg_rho * np.asarray(korg_kappa_array)[:, np.argmin(np.abs(to_numpy(self.korg_wav) - 5000.0))]
+        z_model = z + z_0 # model z, zero at tau_Ross = 1
+        z = tau_anchored_depth(z, tau_5000, alpha_5000)
+
+        #-- Physical radius r = R_base + z, with r = R_phot = sqrt(G M / g) at the model's z = 0, as in Korg
+        self.R_phot = float(np.sqrt(self.G * self.stellar_mass * self.M_sun / 10**self.logg))
+        self.R_base = float(self.R_phot - np.interp(0.0, z_model, z))
+        print(f'R_phot: {self.R_phot}, R_base: {self.R_base}, depth scale: {z_model[-1]-z_model[0]} -> {z[-1]-z[0]} cm')
 
         z_min = z.min()
         z_max = z.max()
@@ -86,11 +123,16 @@ class RadAI():
         elif self.r_norm == 'log': 
             self.R_0 = torch.tensor(1) # no normalization
  
-        #-- Define r_hat range (normalized between 0 and 1 by definition), and I_hat_0
+        #-- Define r_hat range (normalized between 0 and 1 by definition)
 
         self.r_hat_min = self.r_hat_func(self.R_MIN)
         self.r_hat_max = self.r_hat_func(self.R_MAX/self.r_max_factor)
         print(f'r_hat_min: {self.r_hat_min}, r_hat_max:{self.r_hat_max}, R_MIN: {self.r_from_rhat(self.r_hat_min)}, R_MAX: {self.r_from_rhat(self.r_hat_max)}')
+
+        #-- (r_top/R_phot)^2 refers the emergent flux to the photospheric radius (L = 4 pi r^2 F), as Korg does
+        r_top = self.R_base + float(to_numpy(self.r_from_rhat(self.r_hat_max)))
+        self.photosphere_correction = (r_top/self.R_phot)**2
+        print(f'r: {self.R_base + float(to_numpy(self.R_MIN))} -> {r_top} cm, photosphere correction: {self.photosphere_correction}')
        
         #-- Wavelength range in physical units (Angstroms)
         self.LAMBDA_MIN = self.korg_wav.min()  
@@ -99,7 +141,6 @@ class RadAI():
         #-- Define normalization constants
         r_sample = torch.linspace(self.r_hat_min, self.r_hat_max, 1000)
         wav_sample = torch.linspace(self.LAMBDA_MIN, self.LAMBDA_MAX, 1000)
-        self.wav = np.linspace(to_numpy(self.LAMBDA_MIN), to_numpy(self.LAMBDA_MAX), 70)
         self.wav_nn = np.linspace(to_numpy(self.LAMBDA_MIN), to_numpy(self.LAMBDA_MAX), 7001)
 
         self.KAPPA_MIN = torch.tensor(korg_kappa_array.min(), dtype=torch.float32)
@@ -109,7 +150,7 @@ class RadAI():
         # Convert to normalized coordinates for interpolation
         # z is still in physical coordinates at this point
         z_norm = self.r_hat_func(z.astype(float), to_np=True)
-        self.z = z.copy()  # Keep original physical z
+        self.z = z.copy()  # Keep physical z (tau_5000-consistent scale)
 
         # Temperature interpolation using scipy CubicSpline with NORMALIZED coordinates
         self.temp_func = cs(z_norm, temp)
@@ -144,62 +185,18 @@ class RadAI():
         self.tau_0 = (self.RHO_0 * self.K_0 * self.R_0).item()
         print(f'tau_0: {self.tau_0}, RHO_0: {self.RHO_0}, K_0: {self.K_0}, R_0: {self.R_0}, S_0: {self.S_0}')
 
-        # Initial condition function: I(r_min, lambda_hat) = S(r_min, lambda_phys)
-        self.I_hat_0 = lambda lambda_hat: self.S_lam_hat(self.r_hat_min, self.lambda_from_lambda_hat(lambda_hat))
+        #-- Vertical optical depth from the top of the atmosphere, for the escape-weighted physics loss
+        r_hat_tau = np.linspace(r_hat_min_val, r_hat_max_val, 256)
+        lambda_hat_tau = np.linspace(0.0, 1.0, 1024)
+        z_tau = to_numpy(self.R_MIN)*(to_numpy(self.R_MAX)/to_numpy(self.R_MIN))**r_hat_tau
+        alpha_tau = self.rho_func(r_hat_tau)[:, None] * self.kappa_func(r_hat_tau, lambda_hat_tau) # cm^-1
+        dtau = 0.5*(alpha_tau[1:] + alpha_tau[:-1]) * np.diff(z_tau)[:, None]
+        tau_top = np.vstack([np.cumsum(dtau[::-1], axis=0)[::-1], np.zeros((1, len(lambda_hat_tau)))])
+        self.tau_func = RectBivariateSpline(r_hat_tau, lambda_hat_tau, tau_top)
+        print(f'tau from top: {tau_top.min()} - {tau_top.max()}, escape floor: {self.escape_floor}')
 
-        # calculate analytic solution for use during training / plotting
-
-        LAMBDA_MIN, LAMBDA_MAX = to_numpy(self.LAMBDA_MIN), to_numpy(self.LAMBDA_MAX)
-
-        # Analytic blackbody function calculation
-
-        num_bins = nbins(to_numpy(self.R_MIN), to_numpy(self.R_MAX), to_numpy(self.tau_0), tau_factor=1)
-        if num_bins < 1000: num_bins = 1000
-        num_bins = 100
-        self.Rs = np.logspace(np.log10(to_numpy(self.R_MIN)), np.log10(to_numpy(self.R_MAX)), num_bins)
-        self.wav_analytic = np.linspace(LAMBDA_MIN, LAMBDA_MAX, len(self.wav))*1e-8 # Angstroms to cm
-
-        slam_start = datetime.now()
-        
-        S_lam_analytic = np.array([
-            (2*self.h*self.c**2/self.wav_analytic[j]**5) * \
-             1/(np.exp(self.h*self.c/(self.wav_analytic[j]*self.k*self.T(self.r_hat_func(self.Rs[i], to_np=True)))) - 1)
-            for i in range(self.Rs.shape[0])
-            for j in range(len(self.wav_analytic))])
-        
-        self.S_lam_analytic = S_lam_analytic.reshape(len(self.Rs), len(self.wav_analytic))
-        self.S_lam_analytic *= 1e-8 # erg / s / cm2 / cm to erg / s / cm2 / A
-        self.S_lam_analytic /= to_numpy(self.S_0)
-        print('S_lam_analytic calculation took: ', (datetime.now()-slam_start).total_seconds()/60, ' minutes')
-       
-        taus_start = datetime.now()
-
-        # Convert wav_analytic (in cm) to lambda_hat for kappa call
-        wav_analytic_angstrom = self.wav_analytic * 1e8  # cm to Angstrom
-        lambda_hat_analytic = (wav_analytic_angstrom - to_numpy(self.LAMBDA_MIN)) / (to_numpy(self.LAMBDA_MAX) - to_numpy(self.LAMBDA_MIN))
-
-        taus = np.array([simpson(to_numpy(self.rho(self.r_hat_func(self.Rs[:i+1], to_np=True)) * self.kappa(self.r_hat_func(self.Rs[:i+1], to_np=True), lambda_hat_analytic[j])), x = self.Rs[:i+1]) for i in range(self.Rs.shape[0]) for j in range(len(self.wav_analytic))])
-        taus = taus.reshape(len(self.Rs), len(self.wav_analytic))
- 
-        print('taus calculation took: ', (datetime.now()-taus_start).total_seconds()/60, ' minutes')
-       
-        Inu_start = datetime.now()
-
-        # Convert wav_analytic (in Angstroms) to lambda_hat for I_hat_0 call
-        self.I_nu = np.array([
-                    simpson(self.S_lam_analytic[:i+1, j]*np.exp(-(taus[i, j] - taus[:i+1, j])), x=taus[:i+1, j]) + to_numpy(self.I_hat_0(lambda_hat_analytic[j]))*np.exp(-taus[i, j]) for i in range(self.Rs.shape[0])
-                for j in range(len(self.wav_analytic))])
-        print('I_nu calculation took: ', (datetime.now()-Inu_start).total_seconds()/60, ' minutes')
-       
-        self.I_nu = self.I_nu.reshape(len(self.Rs), len(self.wav_analytic))
-        # Use scipy RectBivariateSpline for I_nu interpolation
-        # RectBivariateSpline(x, y, z) where z has shape (len(x), len(y))
-        # I_nu has shape (Rs, wavelengths) so x=Rs, y=wavelengths
-        self.I_nu_func = RectBivariateSpline(
-            self.r_hat_func(self.Rs, to_np=True),  # r_hat values (x-axis)
-            self.wav_analytic*1e8,  # wavelengths in Angstroms (y-axis)
-            self.I_nu  # shape: (len(Rs), len(wav_analytic))
-        )
+        # Depth grid for the intensity plots in make_plots
+        self.Rs = np.logspace(np.log10(to_numpy(self.R_MIN)), np.log10(to_numpy(self.R_MAX)), 100)
 
     def kappa(self, r_hat, lambda_hat):
         """
@@ -297,8 +294,7 @@ class RadAI():
         rho_physical = self.rho_func(r_hat_np)
         result = torch.tensor(rho_physical / self.RHO_0.cpu().numpy(),
                             dtype=torch.float32)
-        if torch.cuda.is_available():
-            result = result.cuda()
+        result = result.to(self.device)
         return result
 
     def kappa_hat(self, r_hat, lambda_hat):
@@ -322,8 +318,25 @@ class RadAI():
 
         result = torch.tensor(kappa_physical / self.K_0.cpu().numpy(),
                             dtype=torch.float32)
-        if torch.cuda.is_available():
-            result = result.cuda()
+        result = result.to(self.device)
+        return result
+
+    def tau_hat(self, r_hat, lambda_hat):
+        """Vertical optical depth from the top of the atmosphere at normalized radius and wavelength."""
+        if torch.is_tensor(r_hat):
+            r_hat_np = r_hat.detach().cpu().numpy()
+        else:
+            r_hat_np = r_hat
+
+        if torch.is_tensor(lambda_hat):
+            lambda_hat_np = lambda_hat.detach().cpu().numpy()
+        else:
+            lambda_hat_np = lambda_hat
+
+        tau = self.tau_func(r_hat_np, lambda_hat_np, grid=False)
+
+        result = torch.tensor(tau, dtype=torch.float32)
+        result = result.to(self.device)
         return result
 
     def S_lam_physical(self, r_hat, lambda_hat):
@@ -370,21 +383,19 @@ class RadAI():
 
         return result
 
-    def S_lam_hat(self, r_hat, lam_phys):
-        """Normalized source function: S_hat = S / S_0. (Legacy method for analytic solution)"""
-        S_phys = self.S_lam(r_hat, lam_phys)
-        if torch.is_tensor(S_phys):
-            return (S_phys / self.S_0).cpu().numpy() if S_phys.is_cuda else S_phys / self.S_0.cpu().numpy()
-        else:
-            return S_phys / self.S_0.cpu().numpy()
-
     def physics_loss(self, r_hat, lambda_hat, mu):
         """
-        Physics loss: residual of radiative transfer equation.
-        PDE: μ * dI_hat/dr_hat = τ₀ * dr/dr_hat * ρ_hat * κ_hat * (S_hat - I_hat)
+        Physics loss: residual of spherically symmetric radiative transfer equation.
+        PDE: μ * dI_hat/dr_hat + (1-μ²)/r * dr/dr_hat * dI_hat/dμ = τ₀ * dr/dr_hat * ρ_hat * κ_hat * (S_hat - I_hat)
+        with r = R_base + z the physical radius.
+
+        Each residual R is weighted by its escape probability exp(-τ/μ): the error it leaves in the
+        emergent intensity is δI(0, μ) = (1/μ) ∫ R exp(-τ/μ) dr_hat. escape_floor keeps the deep
+        atmosphere coupled to the inner boundary condition.
         """
-        # Ensure requires_grad for r_hat
+        # Ensure requires_grad for both r_hat and mu
         r_hat = r_hat.requires_grad_(True)
+        mu = mu.requires_grad_(True)
 
         # Forward pass: I_hat = net(r_hat, lambda_hat, mu)
         inputs = torch.cat([r_hat, lambda_hat, mu], dim=1)
@@ -394,8 +405,23 @@ class RadAI():
         dI_hat_drhat = torch.autograd.grad(
             I_hat, r_hat,
             grad_outputs=torch.ones_like(I_hat),
+            create_graph=True,
+            retain_graph=True  # Need to retain for second gradient
+        )[0]
+
+        # Compute gradient dI_hat/dmu (spherical symmetry term)
+        dI_hat_dmu = torch.autograd.grad(
+            I_hat, mu,
+            grad_outputs=torch.ones_like(I_hat),
             create_graph=True
         )[0]
+
+        # Get physical radius r = R_base + z from normalized coordinates
+        # Ensure R_MIN and R_MAX are on the correct device
+        device = r_hat.device
+        R_MIN = self.R_MIN.to(device) if torch.is_tensor(self.R_MIN) else torch.tensor(self.R_MIN, dtype=torch.float32, device=device)
+        R_MAX = self.R_MAX.to(device) if torch.is_tensor(self.R_MAX) else torch.tensor(self.R_MAX, dtype=torch.float32, device=device)
+        r_phys = self.R_base + R_MIN * (R_MAX / R_MIN) ** r_hat
 
         # Get dimensionless quantities (all take lambda_hat, not physical wavelength)
         rho_hat = self.rho_hat(r_hat)
@@ -403,10 +429,20 @@ class RadAI():
         S_hat = self.S_hat(r_hat, lambda_hat)
         dr_drhat = self.dr_dr_hat(r_hat)
 
-        # PDE residual: μ · dI/dr = ρ·κ·(S - I)
-        residual = mu * dI_hat_drhat - self.tau_0 * dr_drhat * rho_hat * kappa_hat * (S_hat - I_hat)
+        # PDE residual with spherical term
+        # Left side: μ * dI/dr_hat + (1-μ²)/r * dr/dr_hat * dI/dμ
+        # Right side: τ₀ * dr/dr_hat * ρ * κ * (S - I)
+        lhs_radial = mu * dI_hat_drhat
+        lhs_angular = (1 - mu**2) / r_phys * dr_drhat * dI_hat_dmu
+        rhs = self.tau_0 * dr_drhat * rho_hat * kappa_hat * (S_hat - I_hat)
 
-        return torch.mean(residual ** 2)
+        residual = lhs_radial + lhs_angular - rhs
+
+        # Weight by escape probability: a residual at optical depth tau changes the emergent intensity
+        # only in proportion to exp(-tau/mu); escape_floor keeps the deep atmosphere coupled to the inner BC
+        escape_weight = self.escape_floor + torch.exp(-self.tau_hat(r_hat, lambda_hat) / mu.detach())
+
+        return torch.mean((residual * escape_weight) ** 2)
 
     def ic_loss(self, lambda_hat, mu):
         """
@@ -475,7 +511,7 @@ class RadAI():
         """
         Compute emergent flux by integrating over μ.
 
-        F(λ) = 2π ∫₀¹ I(r, λ, μ) · μ · dμ
+        F(λ) = 2π (r_top/R_phot)² ∫₀¹ I(r, λ, μ) · μ · dμ
 
         Args:
             r_hat: Normalized radius (typically r_hat_max for surface flux)
@@ -511,6 +547,9 @@ class RadAI():
 
             # Integrate using trapezoidal rule: ∫ I·μ dμ
             flux[i] = 2 * np.pi * np.trapz(intensities, mu_samples)
+
+        # Refer the flux to the photospheric radius, as Korg does
+        flux *= self.photosphere_correction
 
         return flux
 
@@ -646,9 +685,6 @@ class RadAI():
 
     def make_plots(self):
 
-        # Note: analytic solutions (if computed for multiple mu) would be in self.I_nu_analytic[mu_val]
-        # For now, we'll focus on PINN predictions at multiple mu values and flux comparison
-
         R_MIN, R_MAX = to_numpy(self.R_MIN), to_numpy(self.R_MAX)
         ref_R = np.array([[R_MIN, R_MIN+(R_MAX/self.r_max_factor-R_MIN)/5], [R_MIN+(R_MAX/self.r_max_factor-R_MIN)/2, R_MAX/self.r_max_factor]])
 
@@ -724,7 +760,7 @@ class RadAI():
         pinn_flux = self.compute_flux(self.r_hat_max, lambda_hat_surf, n_mu_samples=50)
         print(f'Flux computation took: {(datetime.now()-flux_start).total_seconds()/60} minutes', flush=True)
 
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(12, 7))
         ax.plot(self.wav_nn, pinn_flux, 'r-', label='PINN flux', linewidth=2)
         ax.plot(to_numpy(self.korg_wav), to_numpy(self.korg_flux), 'b--', label='Korg flux', alpha=0.7, linewidth=2)
         ax.set_xlabel(r'$\lambda$ [Å]', fontsize=14)
@@ -735,8 +771,8 @@ class RadAI():
         ax.set_title(f'Emergent Flux: PINN vs Korg\n{self.test_name}', fontsize=16)
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(f'runs/{self.test_name}/flux_comparison.pdf')
-        print(f'Saved flux comparison plot to runs/{self.test_name}/flux_comparison.pdf', flush=True)
+        plt.savefig(f'runs/{self.test_name}/spherical_Korg_PINN.pdf')
+        print(f'Saved flux comparison plot to runs/{self.test_name}/spherical_Korg_PINN.pdf', flush=True)
 
         fig, ax = plt.subplots(figsize=(8, 6))
         plt.plot(self.history['total'], label='train loss')

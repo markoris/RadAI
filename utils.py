@@ -10,6 +10,7 @@ import astropy.units as u
 from astropy.io import fits
 from astropy import constants
 from torch.optim import Adam
+from natsort import natsorted
 from elem_abundance import abun_elem, abun_meteoric, elem_masses 
 
 def to_numpy(x):
@@ -93,16 +94,19 @@ def load_korg_data():
 
         #-- Load temperature, opacity, and density data
          
-        korg_params = fits.open('sim_data/marcs_t6000_g400_f0.fits')
+        #korg_params = fits.open('sim_data/marcs_t6000_g400_f0.fits')
+        korg_params = fits.open('sim_data/marcs_sph_t5770_g444_f0.fits')
         korg_params = np.array(korg_params[1].data)
-        spec = fits.open('sim_data/korgspec_t6000_g400_f0.fits')
+        #spec = fits.open('sim_data/korgspec_t6000_g400_f0.fits')
+        spec = fits.open('sim_data/korgspec_marcs_sph_5770_444.fits')
         korg_wav = torch.tensor(spec[1].data['wave'].flatten().astype(float), dtype=torch.float32)
         korg_flux = spec[1].data['flux'].astype(float)
-        korg_kappa = fits.open('sim_data/korgalpha_t6000_g400_f0.fits')[1].data
+        #korg_kappa = fits.open('sim_data/korgalpha_t6000_g400_f0.fits')[1].data
+        korg_kappa = fits.open('sim_data/korgalpha_marcs_sph_5770_444.fits')[1].data
 
-        korg_flux *= u.erg / (u.cm**2 * u.s * u.cm * u.sr) # cgs: ergs / s / cm^2 / sr / cm ?
-        korg_flux = korg_flux.to('erg / (cm^2 s AA sr)').value
-        korg_flux = torch.tensor(korg_flux, dtype=torch.float32)
+#        korg_flux *= u.erg / (u.cm**2 * u.s * u.cm * u.sr) # cgs: ergs / s / cm^2 / sr / cm ?
+#        korg_flux = korg_flux.to('erg / (cm^2 s AA sr)').value
+#        korg_flux = torch.tensor(korg_flux, dtype=torch.float32)
 
         n_e = korg_params['electron_number_density'].flatten()*u.cm**-3
         n_gas = korg_params['number_density'].flatten()*u.cm**-3
@@ -137,7 +141,8 @@ def load_korg_data():
         korg_rho = rho_gas + rho_e
 
         # trim
-        z -= z.min()
+        z_0 = z.min() # model z of the deepest layer; the model's z = 0 is at tau_Ross = 1
+        z -= z_0
         z = np.flip(z)
         z[0] += 1 # pretend we start at 1 cm for log-completeness
         temp = np.flip(temp)
@@ -148,18 +153,22 @@ def load_korg_data():
         tau_5000 = np.delete(tau_5000, tau_cut)
         
         # kappa setup
-        for name_idx in range(len(korg_kappa.names)):
-            name = korg_kappa.names[name_idx]
-            opac = korg_kappa[name].flatten()*u.cm**-1/korg_rho[name_idx]
+        #for name_idx in range(len(korg_kappa.names)):
+        for name in natsorted(korg_kappa.names):
+            #name = korg_kappa.names[name_idx]
+            #opac = korg_kappa[name].flatten()*u.cm**-1/korg_rho[name_idx]
+            opac = korg_kappa[name].flatten()*u.cm**-1/korg_rho[int(name[5:])]
             try: korg_kappa_array = np.concatenate((korg_kappa_array, opac[None, :]), axis=0)
             except NameError: korg_kappa_array = opac[None, :]
         korg_kappa_array = np.flip(korg_kappa_array, axis=0).astype('float')
         korg_kappa_array = np.delete(korg_kappa_array, tau_cut, axis=0)
+
+        print(korg_kappa_array)
         
         korg_rho = np.flip(korg_rho.value)
         korg_rho = np.delete(korg_rho, tau_cut)
 
-        return korg_wav, korg_flux, z, temp, korg_rho, korg_kappa_array, tau_5000
+        return korg_wav, korg_flux, z, temp, korg_rho, korg_kappa_array, tau_5000, z_0
 
 class NN(torch.nn.Module):
     def __init__(self):
