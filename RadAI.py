@@ -507,7 +507,7 @@ class RadAI():
 
         return I_physical
 
-    def compute_flux(self, r_hat, lambda_hat_array, n_mu_samples=50):
+    def compute_flux(self, r_hat, lambda_hat_array, n_mu_samples=50, batch_size=100000):
         """
         Compute emergent flux by integrating over μ.
 
@@ -517,6 +517,7 @@ class RadAI():
             r_hat: Normalized radius (typically r_hat_max for surface flux)
             lambda_hat_array: Array of normalized wavelengths
             n_mu_samples: Number of μ samples for integration
+            batch_size: Number of (λ, μ) points per forward pass
 
         Returns:
             flux: Array of flux values at each wavelength [erg/s/cm²/Å]
@@ -527,26 +528,26 @@ class RadAI():
         if torch.is_tensor(r_hat):
             r_hat = r_hat.cpu().numpy()
         r_hat = float(r_hat)
+        lambda_hat_array = np.asarray(to_numpy(lambda_hat_array), dtype=float).flatten()
 
         # Sample μ uniformly
         mu_samples = np.linspace(self.mu_min, self.mu_max, n_mu_samples)
 
-        flux = np.zeros(len(lambda_hat_array))
+        # Evaluate I(r, λ, μ) on the full (λ, μ) grid in batched forward passes
+        inputs = np.empty((len(lambda_hat_array) * n_mu_samples, 3), dtype=np.float32)
+        inputs[:, 0] = r_hat
+        inputs[:, 1] = np.repeat(lambda_hat_array, n_mu_samples)
+        inputs[:, 2] = np.tile(mu_samples, len(lambda_hat_array))
 
-        for i, lambda_hat in enumerate(lambda_hat_array):
-            # Ensure lambda_hat is float
-            if torch.is_tensor(lambda_hat):
-                lambda_hat = lambda_hat.cpu().numpy()
-            lambda_hat = float(lambda_hat)
+        I_hat = []
+        with torch.no_grad():
+            for start in range(0, len(inputs), batch_size):
+                batch = torch.from_numpy(inputs[start:start + batch_size]).to(self.device)
+                I_hat.append(self.net(batch).squeeze(1).cpu().numpy())
+        intensities = np.concatenate(I_hat).reshape(len(lambda_hat_array), n_mu_samples) * self.S_0.cpu().numpy()
 
-            # Compute I(r, λ, μ) for all μ
-            intensities = []
-            for mu in mu_samples:
-                I = self.predict(r_hat, lambda_hat, mu)
-                intensities.append(I * mu)  # Weight by μ for integration
-
-            # Integrate using trapezoidal rule: ∫ I·μ dμ
-            flux[i] = 2 * np.pi * np.trapz(intensities, mu_samples)
+        # Integrate using trapezoidal rule: ∫ I·μ dμ
+        flux = 2 * np.pi * np.trapezoid(intensities * mu_samples, mu_samples, axis=1)
 
         # Refer the flux to the photospheric radius, as Korg does
         flux *= self.photosphere_correction
