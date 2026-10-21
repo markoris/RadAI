@@ -507,16 +507,16 @@ class RadAI():
 
         return I_physical
 
-    def compute_flux(self, r_hat, lambda_hat_array, n_mu_samples=50, batch_size=100000):
+    def compute_flux(self, r_hat, lambda_hat_array, n_mu_samples=20, batch_size=100000):
         """
-        Compute emergent flux by integrating over μ.
+        Compute emergent flux by integrating over μ with Gauss-Legendre quadrature.
 
-        F(λ) = 2π (r_top/R_phot)² ∫₀¹ I(r, λ, μ) · μ · dμ
+        F(λ) = 2π (r_top/R_phot)² ∫ I(r, λ, μ) · μ · dμ over [mu_min, mu_max]
 
         Args:
             r_hat: Normalized radius (typically r_hat_max for surface flux)
             lambda_hat_array: Array of normalized wavelengths
-            n_mu_samples: Number of μ samples for integration
+            n_mu_samples: Number of Gauss-Legendre μ nodes
             batch_size: Number of (λ, μ) points per forward pass
 
         Returns:
@@ -530,8 +530,10 @@ class RadAI():
         r_hat = float(r_hat)
         lambda_hat_array = np.asarray(to_numpy(lambda_hat_array), dtype=float).flatten()
 
-        # Sample μ uniformly
-        mu_samples = np.linspace(self.mu_min, self.mu_max, n_mu_samples)
+        # Gauss-Legendre nodes and weights, mapped from [-1, 1] to [mu_min, mu_max]
+        nodes, weights = np.polynomial.legendre.leggauss(n_mu_samples)
+        mu_samples = 0.5 * (self.mu_max - self.mu_min) * nodes + 0.5 * (self.mu_max + self.mu_min)
+        mu_weights = 0.5 * (self.mu_max - self.mu_min) * weights
 
         # Evaluate I(r, λ, μ) on the full (λ, μ) grid in batched forward passes
         inputs = np.empty((len(lambda_hat_array) * n_mu_samples, 3), dtype=np.float32)
@@ -546,8 +548,8 @@ class RadAI():
                 I_hat.append(self.net(batch).squeeze(1).cpu().numpy())
         intensities = np.concatenate(I_hat).reshape(len(lambda_hat_array), n_mu_samples) * self.S_0.cpu().numpy()
 
-        # Integrate using trapezoidal rule: ∫ I·μ dμ
-        flux = 2 * np.pi * np.trapezoid(intensities * mu_samples, mu_samples, axis=1)
+        # Integrate with Gauss-Legendre quadrature: ∫ I·μ dμ = Σ w_k I(μ_k) μ_k
+        flux = 2 * np.pi * (intensities * mu_samples * mu_weights).sum(axis=1)
 
         # Refer the flux to the photospheric radius, as Korg does
         flux *= self.photosphere_correction
@@ -758,7 +760,7 @@ class RadAI():
         print('Computing PINN flux by integrating over mu...', flush=True)
         flux_start = datetime.now()
         lambda_hat_surf = np.linspace(0, 1, len(self.wav_nn))
-        pinn_flux = self.compute_flux(self.r_hat_max, lambda_hat_surf, n_mu_samples=50)
+        pinn_flux = self.compute_flux(self.r_hat_max, lambda_hat_surf)
         print(f'Flux computation took: {(datetime.now()-flux_start).total_seconds()/60} minutes', flush=True)
 
         fig, ax = plt.subplots(figsize=(12, 7))
